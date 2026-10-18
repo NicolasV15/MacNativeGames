@@ -30,6 +30,8 @@ Shaders are automatically collected, compiled and cached as you play. Returning 
 
 **Shader prewarming on the first launch:** Building the app automatically prepares at least 8,000 shaders from your selected game data and includes them in the app. Even with an empty user cache, the first launch discovers and warms these shaders before the first frame; compatible entries in the pipeline manifest are also warmed. No preliminary play session or manual cache copy is needed. The current 1.4.3 build prepares 8,290 shaders. The first GPU warm-up can take several minutes; see [preparation and test details](docs/first-launch-shaders.md). This is the extractable game shader set, not every binding-dependent variant encountered while playing; new scenes can still compile additional shaders. Playing adds newly encountered shaders and pipelines to your local `pso_collected.tsv`, which is reused on later launches. To share your collected list, send `~/Library/Application Support/MacNativeGames/TOTK/shader-cache/rt-totk-native-v4-unverified/pso_collected.tsv`. It contains shader and pipeline identifiers, not game saves or compiled shader binaries. Lists are tied to the matching translation-chain version.
 
+**Optional asynchronous shaders:** Enable the checkbox on the startup screen, or use the macOS **图形 (Graphics) → 异步着色器** menu. It is off by default and remembered per profile. When enabled, startup does not wait for the complete warm-up; draws with unfinished Metal shader libraries or pipelines are skipped and retried on later frames. Objects, shadows, effects or even parts of the screen can temporarily disappear. Compute work still waits. Turning it off resumes waiting for required shaders; it does not replay previously skipped draws. Shader translation and some specialized functions can still cause stalls.
+
 
 **iPhone and iPad support is coming soon. iPhone 16 or newer models are recommended for the upcoming iPhone version.**
 
@@ -186,6 +188,8 @@ MIT (see [LICENSE](LICENSE)). Third-party code keeps its own license: [THIRD_PAR
 着色器会在游玩过程中自动收集、编译并缓存。再次进入已经去过的场景时，可以复用已有缓存，帧数和流畅度通常会明显改善。**8,582 只是本机测试目前收集到的数量，不是游戏的着色器总数，也不是收集上限**；随着探索更多场景，缓存还会继续增加。
 
 **首次启动的着色器预热：** 构建时自动从你提供的所选版本游戏数据准备至少 8,000 个着色器，并装进 App。即使用户缓存为空，第一次打开也会发现并预热这批着色器，准备好后才显示第一帧；兼容的管线清单也会参与预热，不需要先玩一遍或手动复制缓存。当前 1.4.3 准备 8,290 个；首次 GPU 预热可能需要数分钟，详见[准备过程与实测记录](docs/first-launch-shaders.md)。这是从游戏资源提取的集合，并非游玩中所有绑定状态的动态变体，进入新场景仍可能现编。游玩时新遇到的着色器和管线会写入本机的 `pso_collected.tsv`，下次启动时继续预热。如需分享自己收集的清单，请提供 `~/Library/Application Support/MacNativeGames/TOTK/shader-cache/rt-totk-native-v4-unverified/pso_collected.tsv`。它只包含着色器和管线标识，不含游戏存档或编译后的着色器文件。清单与对应的着色器转换链版本绑定。
+
+**可选的异步着色器：** 在启动界面勾选，或使用 macOS 菜单栏的 **图形 → 异步着色器**。默认关闭，按用户档案保存选择，可随时切换。开启后不再等待整批预热；绘制所需的 Metal 着色器库或管线未就绪时，暂时跳过该次绘制，后续帧重试。物体、阴影、特效乃至部分画面可能暂时缺失或闪烁。计算任务仍然等待。关闭后恢复等待当前需要的着色器，不补做之前已跳过的绘制；新着色器翻译及部分特殊函数构建仍可能卡顿。
 
 
 **即将支持 iPhone 和 iPad。未来的 iPhone 版本推荐使用 iPhone 16 及更新机型。**

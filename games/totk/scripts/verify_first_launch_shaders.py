@@ -49,7 +49,7 @@ def trial(app, output, mode, cache, profile, expected, timeout=1800):
         path.write_text(json.dumps(report, ensure_ascii=False, indent=2)+'\n')
     save()
     env = os.environ | dict(TOTK_PROFILE_DIR=str(profile), TOTK_INPUT_FILE=str(commands),
-        TOTK_SHADER_CACHE=str(cache), TOTK_SHADER_SEED=mode, TOTK_ASSUME_FOCUS='1',
+        TOTK_SHADER_CACHE=str(cache), TOTK_SHADER_SEED=mode, TOTK_ASSUME_FOCUS='1', TOTK_ASYNC_SHADERS='0',
         TOTK_WINDOW_SIZE='1280x720', TOTK_MFX_INTERP='0', TOTK_MFX='0',
         TOTK_MFX_UPSCALE='0', TOTK_MFX_OUTPUT='0')
     for name in ('DM_PSO_MANIFEST', 'TOTK_AUTOLOAD', 'DM_NVN_TSV', 'TOTK_INPUT_SCRIPT', 'TOTK_SURVEY'):

@@ -7,6 +7,7 @@
 #include <math.h>
 #include "runtime.h"
 #include "game_version.h"
+#include "../third_party/d2r_gfx/gfx/nvn/nvn_async_compile.h"
 static NSWindow *window;
 uint64_t dm_nvn_frame_count(void);   /* gfx/nvn/hle_nvn.c: game frames presented so far */
 static CAMetalLayer *metalLayer;
@@ -14,6 +15,8 @@ static NSView *bootOverlay;
 static NSTextField *bootStage,*bootDetail;
 static NSProgressIndicator *bootProgress;
 static NSView *shortcutHelp;
+static NSButton *asyncShaderCheckbox;
+static NSMenuItem *asyncShaderMenuItem;
 static uint64_t bootStartNS;
 static _Atomic uint64_t presentedFrames;
 static _Atomic int warmPending;
@@ -28,7 +31,7 @@ void *front_metal_layer(void){return (__bridge void *)metalLayer;}
 void front_frame_presented(void){
  if(atomic_fetch_add_explicit(&presentedFrames,1,memory_order_relaxed)==0){
   fprintf(stderr,"[totk-boot] %.3f first presented frame\n",(runtime_now_ns()-bootStartNS)/1e9);
-  dispatch_async(dispatch_get_main_queue(), ^{if(!atomic_load(&warmPending))bootOverlay.hidden=YES;});
+  dispatch_async(dispatch_get_main_queue(), ^{if(nvn_async_shaders_enabled()||!atomic_load(&warmPending))bootOverlay.hidden=YES;});
  }
 }
 void runtime_boot_progress(const char *stage,uint64_t done,uint64_t total){
@@ -141,6 +144,36 @@ static void note_occlusion(const char *when){int v=(window.occlusionState&NSWind
 -(void)windowDidChangeBackingProperties:(NSNotification *)n{(void)n;front_sync_drawable();}
 @end
 static TOTKWindowDelegate *windowDelegate;
+@interface TOTKGraphicsSettings : NSObject
+-(void)toggleAsyncShaders:(id)sender;
+@end
+@implementation TOTKGraphicsSettings
+-(void)toggleAsyncShaders:(id)sender {
+ (void)sender;
+ int on=!nvn_async_shaders_enabled();
+ int saved=nvn_async_shaders_set(on,1);
+ asyncShaderCheckbox.state=on?NSControlStateValueOn:NSControlStateValueOff;
+ asyncShaderMenuItem.state=asyncShaderCheckbox.state;
+ if(on&&atomic_load(&presentedFrames))bootOverlay.hidden=YES;
+ if(!saved){NSAlert *alert=[NSAlert new];alert.messageText=@"设置已生效，但未能保存";alert.informativeText=@"下次启动可能需要重新选择。请检查游戏用户数据目录是否可写。";[alert beginSheetModalForWindow:window completionHandler:nil];}
+}
+@end
+static TOTKGraphicsSettings *graphicsSettings;
+static void graphics_menu(void) {
+ graphicsSettings=[TOTKGraphicsSettings new];
+ NSMenu *bar=[NSMenu new];
+ NSMenuItem *app=[NSMenuItem new];[bar addItem:app];
+ NSMenu *appMenu=[[NSMenu alloc] initWithTitle:@"游戏"];app.submenu=appMenu;
+ NSMenuItem *quit=[[NSMenuItem alloc] initWithTitle:@"退出游戏" action:@selector(performClose:) keyEquivalent:@"q"];quit.target=window;[appMenu addItem:quit];
+ NSMenuItem *graphics=[[NSMenuItem alloc] initWithTitle:@"图形" action:nil keyEquivalent:@""];[bar addItem:graphics];
+ NSMenu *menu=[[NSMenu alloc] initWithTitle:@"图形"];graphics.submenu=menu;
+ asyncShaderMenuItem=[[NSMenuItem alloc] initWithTitle:@"异步着色器（可能暂时缺少画面内容）" action:@selector(toggleAsyncShaders:) keyEquivalent:@""];
+ asyncShaderMenuItem.target=graphicsSettings;
+ asyncShaderMenuItem.state=nvn_async_shaders_enabled()?NSControlStateValueOn:NSControlStateValueOff;
+ [menu addItem:asyncShaderMenuItem];
+ NSMenuItem *note=[[NSMenuItem alloc] initWithTitle:@"未就绪时跳过绘制，编译完成后恢复" action:nil keyEquivalent:@""];note.enabled=NO;[menu addItem:note];
+ NSApp.mainMenu=bar;
+}
 int runtime_front_window_visible(void){return atomic_load(&windowVisible);}
 void runtime_front_request_close(void){dispatch_async(dispatch_get_main_queue(), ^{[window performClose:nil];});}
 static void *guest_main(void *callback){@autoreleasepool{((void(*)(void))callback)();}return NULL;}
@@ -148,6 +181,7 @@ void runtime_front_run(void(*callback)(void)){
  @autoreleasepool{
   bootStartNS=runtime_now_ns();
   [NSApplication sharedApplication];[NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+  nvn_async_shaders_configure(getenv("TOTK_PROFILE_DIR"));
   runtime_gamepad_start();
   /* Default window: the docked output size, 1920x1080, scaled down (16:9 kept) when the screen's visible area is smaller. */
   /* TOTK_WINDOW_SIZE=<w>x<h> (test scripts only, e.g. the 2K output test; the desktop launcher never sets it): another starting size. */
@@ -160,6 +194,7 @@ void runtime_front_run(void(*callback)(void)){
   const char *owner=getenv("TOTK_SLOT_OWNER"),*purpose=getenv("TOTK_SLOT_PURPOSE");
   window.title=owner&&*owner&&strcmp(owner,"user")?[NSString stringWithFormat:@"测试局（%s）Ver. %s：%s — 存档副本，进度不会存进你的存档，脚本会自己关闭",owner,TOTK_GAME_VERSION,purpose&&*purpose?purpose:"代理测试"]:[NSString stringWithFormat:@"Tears of the Kingdom  Mac — Ver. %s",TOTK_GAME_VERSION];
   windowDelegate=[TOTKWindowDelegate new];window.delegate=windowDelegate;
+  graphics_menu();
   window.collectionBehavior|=NSWindowCollectionBehaviorFullScreenPrimary;
   window.contentView=[[TOTKInputView alloc] initWithFrame:NSMakeRect(0,0,ww,wh)];
   metalLayer=[CAMetalLayer layer];metalLayer.device=MTLCreateSystemDefaultDevice();metalLayer.pixelFormat=MTLPixelFormatBGRA8Unorm;metalLayer.drawableSize=CGSizeMake(ww,wh);
@@ -175,6 +210,12 @@ void runtime_front_run(void(*callback)(void)){
   bootProgress=[[NSProgressIndicator alloc] initWithFrame:NSMakeRect(ww/2-140,wh/2-55,280,10)];
   bootProgress.minValue=0;bootProgress.maxValue=100;bootProgress.indeterminate=YES;bootProgress.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
   [bootOverlay addSubview:bootStage];[bootOverlay addSubview:bootDetail];[bootOverlay addSubview:bootProgress];
+  asyncShaderCheckbox=[NSButton checkboxWithTitle:@"异步着色器：未就绪时暂不绘制（可能缺少物体或特效）" target:graphicsSettings action:@selector(toggleAsyncShaders:)];
+  asyncShaderCheckbox.state=nvn_async_shaders_enabled()?NSControlStateValueOn:NSControlStateValueOff;
+  asyncShaderCheckbox.frame=NSMakeRect(ww/2-260,wh/2-110,520,32);
+  asyncShaderCheckbox.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
+  asyncShaderCheckbox.appearance=[NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+  [bootOverlay addSubview:asyncShaderCheckbox];
   [window.contentView addSubview:bootOverlay];[bootProgress startAnimation:nil];
   shortcutHelp=[[TOTKShortcutHelp alloc] initWithFrame:NSZeroRect];shortcutHelp.autoresizingMask=NSViewMinXMargin|NSViewMaxXMargin|NSViewMinYMargin|NSViewMaxYMargin;
   /* Keep discovery/warm-up visible; the help appears after the opaque boot
