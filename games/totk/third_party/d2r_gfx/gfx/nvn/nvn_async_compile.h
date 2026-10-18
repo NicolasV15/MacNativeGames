@@ -17,5 +17,9 @@ typedef NS_ENUM(int, NVNCompileState) {
 - (BOOL)containsKey:(id<NSCopying>)key;
 - (id)resultForKey:(id<NSCopying>)key wait:(BOOL)wait
              build:(id (^)(void))build state:(NVNCompileState *)state;
+/* Blocking warm-only request. Coalesces in-flight work, but releases the cache's
+   ownership once all callers return unless a persistent request joined it. */
+- (id)transientResultForKey:(id<NSCopying>)key
+                    build:(id (^)(void))build state:(NVNCompileState *)state;
 @end
 #endif

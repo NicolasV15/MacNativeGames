@@ -4756,15 +4756,25 @@ static NvShader *shader_load_raw(NSString *pc, int stage) {
     return o;
 }
 
-static NvShader *shader_request(NSString *pc, int stage, BOOL wait, NVNCompileState *state) {
+static NVNCompileCache *shader_compile_cache(void) {
     static NVNCompileCache *cache; static dispatch_once_t once;
     dispatch_once(&once, ^{ cache = [[NVNCompileCache alloc] initWithLimit:64]; });
+    return cache;
+}
+static NvShader *shader_request(NSString *pc, int stage, BOOL wait, NVNCompileState *state) {
     NSString *key = [NSString stringWithFormat:@"%d:%@", stage, pc];
-    return [cache resultForKey:key wait:wait build:^{ return shader_load_raw(pc, stage); } state:state];
+    return [shader_compile_cache() resultForKey:key wait:wait build:^{ return shader_load_raw(pc, stage); } state:state];
 }
 static NvShader *shader_load(NSString *pc, int stage) {
     NVNCompileState state;
+#if TARGET_OS_IPHONE
+    // warm_filled/warm_light keep only a temporary shader/batch. Do not promote
+    // their results into permanent residents; rendering still uses shader_get.
+    NSString *key = [NSString stringWithFormat:@"%d:%@", stage, pc];
+    return [shader_compile_cache() transientResultForKey:key build:^{ return shader_load_raw(pc, stage); } state:&state];
+#else
     return shader_request(pc, stage, YES, &state);
+#endif
 }
 static uint64_t g_async_shader_skips, g_async_pso_skips;
 static void async_skip(int pipeline) {
@@ -5821,33 +5831,9 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
 // ---- Parallel precompile: pipelines met for the first time used to be compiled synchronously one by one on the submit thread; 9 misses in a row in one frame = 284 ms (heavy scene on a real device).
 // Now: on the first pipeline miss in a submission, scan ahead once along the remaining commands (replaying state only, no drawing) and kick all the normal-pass pipelines that will also miss later to the background to compile in parallel;
 // when the submit thread reaches that draw it only waits for 'the remaining time not yet compiled'. The compiled pipelines are identical to synchronously compiled ones (same descriptor). Pipeline keys of merged passes / specialized fragments depend on the planning result at replay time, are not predicted, and are compiled synchronously as before.
-#define PSO_PEND_MAX 384
-static struct { pso_key k; id<MTLRenderPipelineState> ps; int used, done; } g_pp[PSO_PEND_MAX];
-static pthread_mutex_t g_pp_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_pp_cv = PTHREAD_COND_INITIALIZER;
-static uint64_t g_pp_submit_mark, g_pp_kicked, g_pp_taken;   // 本次提交是否已预测过（按提交序号）；累计丢出 / 领用条数 | Whether this submission has already been predicted (by submission serial); cumulative kicked / taken counts
+#include "nvn_pso_pending.h"
+static uint64_t g_pp_submit_mark, g_pp_taken;
 static void pso_predict_rest(void);
-static int pso_pend_find(const pso_key *k) { for (int i = 0; i < PSO_PEND_MAX; i++) if (g_pp[i].used && !memcmp(&g_pp[i].k, k, sizeof *k)) return i; return -1; }
-static void pso_pend_kick(const pso_key *k, NvShader *vs, NvShader *fs) {   // 提交线程调：没在缓存、没在表里才丢 | Called by the submit thread: kick only if it is neither in the cache nor in the table
-    if (hm_get_id(&g_pso, k)) return;
-    pthread_mutex_lock(&g_pp_mu);
-    int at = pso_pend_find(k), slot = -1;
-    if (at < 0) for (int i = 0; i < PSO_PEND_MAX; i++) if (!g_pp[i].used) { slot = i; break; }
-    if (at < 0 && slot >= 0) { g_pp[slot].k = *k; g_pp[slot].ps = nil; g_pp[slot].done = 0; g_pp[slot].used = 1; }
-    pthread_mutex_unlock(&g_pp_mu);
-    if (at >= 0 || slot < 0) return;
-    MTLRenderPipelineDescriptor *d = pso_desc(k, vs, fs, nil, 0); g_pp_kicked++;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSError *e = nil; id<MTLRenderPipelineState> ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
-        pthread_mutex_lock(&g_pp_mu); g_pp[slot].ps = ps; g_pp[slot].done = 1; pthread_cond_broadcast(&g_pp_cv); pthread_mutex_unlock(&g_pp_mu);
-    });
-}
-static id<MTLRenderPipelineState> pso_pend_take(const pso_key *k) {   // 提交线程调：表里有就等它编完并取走；没有返回 nil | Called by the submit thread: if it is in the table, wait for it to finish compiling and take it; otherwise return nil
-    pthread_mutex_lock(&g_pp_mu);
-    int at = pso_pend_find(k); id<MTLRenderPipelineState> ps = nil;
-    if (at >= 0) { while (!g_pp[at].done) pthread_cond_wait(&g_pp_cv, &g_pp_mu); ps = g_pp[at].ps; g_pp[at].ps = nil; g_pp[at].used = 0; }
-    pthread_mutex_unlock(&g_pp_mu);
-    return ps;
-}
 static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRenderPassDescriptor *unused) {
     (void)unused;
     __unsafe_unretained NvShader *vs = pr->sh[0], *fs = pr->sh[1];
@@ -5860,16 +5846,19 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
     if (cached) return cached;
     id<MTLRenderPipelineState> ps;
     NSError *e = nil; uint64_t bt = bp_now();
-    static NVNCompileCache *async_cache;
     BOOL async = nvn_async_shaders_enabled();
-    if (async && !async_cache) async_cache = [[NVNCompileCache alloc] initWithLimit:64];
-    NSData *async_key = async_cache ? [NSData dataWithBytes:&k length:sizeof k] : nil;
-    if (async || (async_cache && [async_cache containsKey:async_key])) {
+    int predicted_pending = 0;
+    ps = g_pso_lmap ? nil : pso_pend_take(&k, !async, &predicted_pending);
+    if (predicted_pending) { async_skip(1); return nil; }
+    if (async && !g_async_pso_cache) g_async_pso_cache = [[NVNCompileCache alloc] initWithLimit:64];
+    NSData *async_key = g_async_pso_cache ? pso_async_key(&k) : nil;
+    if (ps) { g_pp_taken++; g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt; }
+    else if (async || [g_async_pso_cache containsKey:async_key]) {
         NVNCompileState state;
         pso_key snapshot = k;
         id<MTLFunction> fn = g_pso_fsfn;
         BOOL merged = g_pso_lmap != NULL;
-        ps = [async_cache resultForKey:async_key wait:!async build:^{
+        ps = [g_async_pso_cache resultForKey:async_key wait:!async build:^{
             NSError *error = nil;
             id<MTLRenderPipelineState> result = [g_dev newRenderPipelineStateWithDescriptor:pso_desc(&snapshot, vs, fs, fn, merged) error:&error];
             if (!result) MLOG("[async-shaders] pipeline FAILED: %s", error.localizedDescription.UTF8String);
@@ -5879,14 +5868,10 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get(NvProg *pr, MTLRen
         if (state == NVNCompileFailed) return nil; /* logged once, not pending forever */
         MLOG("[async-shaders] pipeline ready: vs %s ps %s", vs->key, fs ? fs->key : "-");
     } else {
-    ps = g_pso_lmap ? nil : pso_pend_take(&k);
-    if (ps) g_pp_taken++;
-    else {
         if (g_pp_submit_mark != g_sub_serial) { g_pp_submit_mark = g_sub_serial; pso_predict_rest(); }   // 本次提交第一次缺：先把后面的丢出去并行编，再同步编眼前这条 | First miss in this submission: first kick the later ones out to compile in parallel, then synchronously compile the one at hand
         MTLRenderPipelineDescriptor *d = pso_desc(&k, vs, fs, g_pso_fsfn, g_pso_lmap != NULL);
         ps = [g_dev newRenderPipelineStateWithDescriptor:d error:&e];
-    }
-    g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
+        g_bp_pso_n++; g_bp_pso_ns += bp_now() - bt;
     }
     if (!ps) { static int said; if (said++ < 12) MLOG("【红】建渲染管线失败：%s（vs %s ps %s dfmt %d sfmt %d cfmt0 %d samples %d）", e.localizedDescription.UTF8String, vs->key, fs ? fs->key : "-", (int)k.dfmt, (int)k.sfmt, (int)k.cfmt[0], (int)k.samples); else if (said == 12) MLOG("【红】建渲染管线失败：后续不再逐条打印"); return nil; }
     pso_skey sk; char shex[sizeof sk * 2 + 1]; pso_skey_from(&k, vs, fs, g_pso_lmap != NULL, g_pso_lmap ? &g_pso_fz : NULL, &sk); pso_skey_hex(&sk, shex);

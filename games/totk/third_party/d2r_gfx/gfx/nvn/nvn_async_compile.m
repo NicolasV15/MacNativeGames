@@ -46,6 +46,8 @@ int nvn_async_shaders_set(int value, int persist) {
 @interface NVNCompileJob : NSObject
 @property BOOL done;
 @property(strong) id result;
+@property BOOL keepResult;
+@property NSUInteger callers;
 @end
 @implementation NVNCompileJob @end
 
@@ -74,13 +76,25 @@ int nvn_async_shaders_set(int value, int persist) {
     [_condition lock]; BOOL found = _jobs[key] != nil; [_condition unlock]; return found;
 }
 - (id)resultForKey:(id<NSCopying>)key wait:(BOOL)wait build:(id (^)(void))build state:(NVNCompileState *)state {
+    return [self resultForKey:key wait:wait keepResult:YES build:build state:state];
+}
+- (id)transientResultForKey:(id<NSCopying>)key build:(id (^)(void))build state:(NVNCompileState *)state {
+    return [self resultForKey:key wait:YES keepResult:NO build:build state:state];
+}
+- (id)resultForKey:(id<NSCopying>)key wait:(BOOL)wait keepResult:(BOOL)keep
+             build:(id (^)(void))build state:(NVNCompileState *)state {
     [_condition lock];
     NVNCompileJob *job = _jobs[key];
+    BOOL created = job == nil;
     if (!job) {
         if (!wait && _pending >= _limit) {
             [_condition unlock]; *state = NVNCompilePending; return nil; /* retry next frame */
         }
         job = [NVNCompileJob new]; _jobs[key] = job; ++_pending;
+    }
+    ++job.callers;
+    job.keepResult |= keep;
+    if (created) {
         if (wait) {
             [_condition unlock]; [self finish:job build:build]; [_condition lock];
         } else dispatch_async(_queue, ^{ [self finish:job build:build]; });
@@ -88,6 +102,8 @@ int nvn_async_shaders_set(int value, int persist) {
     while (wait && !job.done) [_condition wait];
     *state = !job.done ? NVNCompilePending : job.result ? NVNCompileReady : NVNCompileFailed;
     id result = job.result;
+    --job.callers;
+    if (job.done && !job.keepResult && !job.callers) [_jobs removeObjectForKey:key];
     [_condition unlock];
     return result;
 }
